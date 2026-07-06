@@ -1,119 +1,145 @@
 // supabase/functions/m3u8-proxy/index.ts
 
 // ============================================
-// تنظیمات - این بخش را مطابق نیاز تغییر دهید
-// ============================================
-const CONFIG = {
-  // آدرس سرور مبدأ (بدون اسلش انتهایی)
-  TARGET_BASE_URL: "https://example.com/live/stream",
-  
-  // هدرهای مجاز برای ارسال به کلاینت
-  ALLOWED_HEADERS: [
-    "content-type",
-    "content-length",
-    "cache-control",
-    "accept-ranges",
-    "content-range",
-  ],
-};
-
-// ============================================
 // تابع اصلی Edge Function
 // ============================================
 Deno.serve(async (req: Request) => {
   try {
-    // دریافت مسیر درخواستی
     const url = new URL(req.url);
-    const path = url.pathname.replace("/m3u8-proxy", ""); // حذف نام تابع از مسیر
     
-    // اگر مسیر خالی بود، روت اصلی را نشان بده
-    const targetPath = path || "/index.m3u8";
+    // ==========================================
+    // دریافت آدرس M3U8 از پارامتر url
+    // ==========================================
+    const targetUrl = url.searchParams.get("url");
     
-    // ساخت آدرس کامل سرور مبدأ
-    const targetUrl = `${CONFIG.TARGET_BASE_URL}${targetPath}`;
+    if (!targetUrl) {
+      return new Response(
+        JSON.stringify({
+          error: "پارامتر url الزامی است",
+          example: "/m3u8-proxy?url=https://example.com/stream.m3u8"
+        }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    }
+    
+    // اعتبارسنجی ساده آدرس
+    try {
+      new URL(targetUrl);
+    } catch {
+      return new Response(
+        JSON.stringify({ error: "آدرس وارد شده معتبر نیست" }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+    }
     
     console.log(`🔄 پراکسی کردن: ${targetUrl}`);
     
+    // ==========================================
     // ارسال درخواست به سرور مبدأ
+    // ==========================================
     const response = await fetch(targetUrl, {
       headers: {
         "User-Agent": "M3U8-Proxy/1.0",
-        // می‌توانید هدرهای اضافی مثل Referer را هم اضافه کنید
-        // "Referer": "https://example.com",
+        // هدرهای اصلی درخواست کلاینت را هم ارسال کن
+        ...Object.fromEntries(
+          Array.from(req.headers.entries())
+            .filter(([key]) => 
+              ["referer", "origin", "cookie"].includes(key.toLowerCase())
+            )
+        ),
       },
     });
     
-    // اگر پاسخ موفق نبود
     if (!response.ok) {
       return new Response(
-        `خطا در دریافت محتوا از سرور مبدأ: ${response.status}`,
+        `خطا در دریافت محتوا: ${response.status} ${response.statusText}`,
         { status: response.status }
       );
     }
     
-    // دریافت محتوای پاسخ
+    // ==========================================
+    // دریافت محتوا و پردازش
+    // ==========================================
     const contentType = response.headers.get("content-type") || "";
     const body = await response.arrayBuffer();
-    
-    // ==========================================
-    // پردازش ویژه برای فایل‌های M3U8
-    // ==========================================
     let finalBody = body;
     
-    if (contentType.includes("application/vnd.apple.mpegurl") || 
-        contentType.includes("audio/mpegurl") ||
-        targetPath.endsWith(".m3u8") ||
-        targetPath.endsWith(".m3u")) {
-      
-      // تبدیل به متن برای پردازش
+    // تشخیص فایل M3U8
+    const isM3U8 = 
+      contentType.includes("application/vnd.apple.mpegurl") ||
+      contentType.includes("audio/mpegurl") ||
+      targetUrl.includes(".m3u8") ||
+      targetUrl.includes(".m3u");
+    
+    if (isM3U8) {
       const text = new TextDecoder().decode(body);
       
-      // تصحیح مسیرهای نسبی در پلی‌لیست
-      // مثال: "segment_001.ts" -> "/m3u8-proxy/segment_001.ts"
-      const basePath = `/m3u8-proxy/`;
+      // ==========================================
+      // پردازش پلی‌لیست M3U8
+      // ==========================================
+      const baseUrl = new URL(targetUrl);
+      const basePath = baseUrl.origin + baseUrl.pathname.substring(0, baseUrl.pathname.lastIndexOf("/") + 1);
       
-      const processedText = text
+      const processedLines = text
         .split("\n")
         .map(line => {
-          // خطوطی که با # شروع می‌شوند (تگ‌های M3U8) را نادیده بگیر
-          if (line.startsWith("#")) return line;
-          
-          // خطوط خالی را نادیده بگیر
-          if (!line.trim()) return line;
-          
-          // اگر آدرس مطلق (شامل http:// یا https://) است، تغییری نده
-          if (line.includes("://")) return line;
-          
-          // اگر آدرس با / شروع شده، آن را به مسیر پراکسی تبدیل کن
-          if (line.startsWith("/")) {
-            return `${basePath}${line.substring(1)}`;
+          // خطوط خالی یا کامنت‌های اطلاعاتی را نگه دار
+          if (!line.trim() || line.startsWith("#EXT")) {
+            return line;
           }
           
-          // در غیر این صورت (مسیر نسبی)، به مسیر پراکسی تبدیل کن
-          return `${basePath}${line}`;
+          // اگر آدرس مطلق است، تغییر نده
+          if (line.includes("://")) {
+            return line;
+          }
+          
+          // ساخت آدرس جدید از طریق پروکسی
+          let absoluteUrl: string;
+          if (line.startsWith("/")) {
+            // آدرس مطلق نسبی به دامنه
+            absoluteUrl = baseUrl.origin + line;
+          } else {
+            // آدرس نسبی
+            absoluteUrl = basePath + line;
+          }
+          
+          // تبدیل به آدرس پروکسی شده
+          const proxyUrl = `/m3u8-proxy?url=${encodeURIComponent(absoluteUrl)}`;
+          return proxyUrl;
         })
         .join("\n");
       
-      finalBody = new TextEncoder().encode(processedText);
+      finalBody = new TextEncoder().encode(processedLines);
     }
     
     // ==========================================
     // ساخت پاسخ نهایی
     // ==========================================
-    const responseHeaders = new Headers();
+    const responseHeaders = new Headers({
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Range, Content-Type",
+    });
     
-    // انتقال هدرهای مجاز از سرور مبدأ
-    CONFIG.ALLOWED_HEADERS.forEach(header => {
+    // انتقال هدرهای مفید از سرور مبدأ
+    const usefulHeaders = ["content-type", "cache-control", "accept-ranges"];
+    usefulHeaders.forEach(header => {
       const value = response.headers.get(header);
       if (value) {
         responseHeaders.set(header, value);
       }
     });
     
-    // تنظیم هدر CORS برای دسترسی از مرورگر
-    responseHeaders.set("Access-Control-Allow-Origin", "*");
-    responseHeaders.set("Access-Control-Allow-Methods", "GET, OPTIONS");
-    responseHeaders.set("Access-Control-Allow-Headers", "Range, Content-Type");
+    // اگر محتوای M3U8 است، نوع آن را به‌روزرسانی کن
+    if (isM3U8) {
+      responseHeaders.set("content-type", "application/vnd.apple.mpegurl");
+    }
     
     return new Response(finalBody, {
       status: response.status,
@@ -123,8 +149,17 @@ Deno.serve(async (req: Request) => {
   } catch (error) {
     console.error("❌ خطا:", error);
     return new Response(
-      `خطای داخلی سرور: ${error.message}`,
-      { status: 500 }
+      JSON.stringify({ 
+        error: "خطای داخلی سرور", 
+        details: error.message 
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
+      }
     );
   }
 });
+
+// ============================================
+// پشتیبانی از درخواست OPTIONS (C
